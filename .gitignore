@@ -1,17 +1,3 @@
-# Dart / Flutter
 .dart_tool/
-.packages
 build/
-.flutter-plugins
-.flutter-plugins-dependencies
-
-# This is a package; lockfile should not be committed.
 pubspec.lock
-
-# IDE
-.idea/
-.vscode/
-*.iml
-
-# OS
-.DS_Store
