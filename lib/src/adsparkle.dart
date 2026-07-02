@@ -24,7 +24,7 @@ const int _kChainTtlMs = 7 * 24 * 60 * 60 * 1000; // 604800000
 /// is exceeded the oldest event is dropped.
 const int _kMaxQueueSize = 100;
 
-/// AdSparkle — the Flutter client SDK for the Viralif/AdBird affiliate
+/// AdSparkle — the Flutter client SDK for the AdSparkle affiliate
 /// attribution tracking platform.
 ///
 /// Access the SDK through the [instance] singleton:

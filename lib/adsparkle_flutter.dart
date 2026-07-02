@@ -1,4 +1,4 @@
-/// AdSparkle — Flutter client SDK for the Viralif/AdBird affiliate
+/// AdSparkle — Flutter client SDK for the AdSparkle affiliate
 /// attribution tracking platform.
 ///
 /// Pure Dart, no platform channels. Use [AdSparkle.instance] to configure

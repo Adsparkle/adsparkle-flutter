@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4
+
+- Rebrand: package description, docs and license now reference **AdSparkle**
+  (formerly "Viralif / AdBird"). No code changes.
+
 ## 0.1.3
 
 - Accept company custom-event shortIds (e.g. `YE2YFSQ`) as `eventType` — the

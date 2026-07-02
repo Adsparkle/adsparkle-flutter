@@ -1,6 +1,6 @@
 # adsparkle_flutter
 
-Flutter client SDK for the **Viralif / AdBird** affiliate attribution tracking
+Flutter client SDK for the **AdSparkle** affiliate attribution tracking
 platform. Pure Dart — **no platform channels**.
 
 Mobile apps use this SDK to capture an attribution `click_id` from a deep link
@@ -17,7 +17,7 @@ Or add to your app's `pubspec.yaml` manually:
 
 ```yaml
 dependencies:
-  adsparkle_flutter: ^0.1.3
+  adsparkle_flutter: ^0.1.4
 ```
 
 Then:
