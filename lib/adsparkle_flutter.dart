@@ -5,5 +5,5 @@
 /// the SDK and send attribution events.
 library adsparkle_flutter;
 
-export 'src/adsparkle.dart' show AdSparkle;
+export 'src/adsparkle.dart' show AdSparkle, AdSparkleEnvironment;
 export 'src/adsparkle_event.dart' show AdSparkleEventType;

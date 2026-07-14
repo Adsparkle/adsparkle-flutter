@@ -1,0 +1,60 @@
+// AdSparkle Flutter plugin — Android side (Play Install Referrer).
+//
+// Registered via pubspec `flutter.plugin.platforms.android`; Flutter's tooling
+// includes this Gradle project in the host app build. Exposes the
+// `co.adsparkle/install_referrer` MethodChannel (see lib/src/install_referrer.dart).
+
+group 'co.adsparkle.adsparkle_flutter'
+version '1.0'
+
+buildscript {
+    ext.kotlin_version = '1.7.10'
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.3.0'
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+apply plugin: 'kotlin-android'
+
+android {
+    // AGP 7+ uses `namespace`; older AGP reads the package from the manifest.
+    if (project.android.hasProperty("namespace")) {
+        namespace 'co.adsparkle.adsparkle_flutter'
+    }
+
+    compileSdkVersion 33
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    defaultConfig {
+        minSdkVersion 19
+    }
+}
+
+dependencies {
+    implementation "com.android.installreferrer:installreferrer:2.2"
+}

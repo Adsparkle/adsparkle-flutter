@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="co.adsparkle.adsparkle_flutter">
+    <!--
+      InstallReferrer needs no permission. The `package` attribute is required by
+      AGP < 8; AGP 8 uses the `namespace` from build.gradle instead (both point to
+      co.adsparkle.adsparkle_flutter).
+    -->
+</manifest>

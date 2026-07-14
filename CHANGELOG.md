@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.5
+
+- `configure()` now accepts an optional `linkDomainSuffix` (default
+  `.go.adsparkle.co`) so test/prod deployments can use different link domains,
+  mirroring the backend `LINK_DOMAIN_SUFFIX` env. Existing calls are unchanged.
+- Deferred attribution: Play Install Referrer capture, probabilistic `/match`,
+  and register-click for app-installed universal-link opens.
+
 ## 0.1.4
 
 - Rebrand: package description, docs and license now reference **AdSparkle**

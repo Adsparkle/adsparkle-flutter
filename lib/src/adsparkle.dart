@@ -5,8 +5,16 @@ import 'package:flutter/foundation.dart';
 
 import 'adsparkle_event.dart';
 import 'deeplink.dart';
+import 'install_referrer.dart';
+import 'match_client.dart';
 import 'postback_client.dart';
+import 'register_client.dart';
 import 'storage.dart';
+
+/// ADIM 5: Universal Link/App Links kok domain'i (<slug>.go.adsparkle.co). Hardcode.
+/// handleDeepLink yalnizca bu suffix'li URL'lerde register-click cagirir; merchant'in
+/// kendi deep-link'lerinde DEGIL. NOT: enterprise link domain gelirse bu kontrol kirilir.
+const String _kLinkDomainSuffix = '.go.adsparkle.co';
 
 /// Default tracking API base URL.
 const String _kDefaultBaseUrl = 'https://api.adsparkle.co';
@@ -37,8 +45,18 @@ const int _kMaxQueueSize = 100;
 ///   transactionId: 'txn_1', amount: 9.99, currency: 'USD');
 /// ```
 ///
-/// The SDK is pure Dart — there are no platform channels. The [companyKey] is
-/// a *publishable* `co_` key, not a secret; no HMAC secret is ever used.
+/// The [companyKey] is a *publishable* `co_` key, not a secret; no HMAC secret
+/// is ever used. The only native code is an Android platform channel that reads
+/// the Play Install Referrer for deterministic install attribution (see
+/// [InstallReferrer]); every other platform runs pure Dart.
+
+/// ADIM 4: SDK çalışma ortamı. [sandbox] → tüm giden isteklere (postback,
+/// register-click, /match) `test: true` eklenir; backend ClickEvent/
+/// InstallFingerprint YAZMAZ, postback yalnızca şekil-doğrulanır (ledger etkilenmez).
+/// Varsayılan [production]. Storage'a BOOL olarak çözülür (enum serialize EDİLMEZ —
+/// değer değişirse eski storage kırılmasın).
+enum AdSparkleEnvironment { production, sandbox }
+
 class AdSparkle {
   AdSparkle._({
     AdSparkleStorage? storage,
@@ -63,13 +81,28 @@ class AdSparkle {
 
   bool _configured = false;
   bool _debug = false;
+  /// ADIM 4: sandbox modu mu? true ise giden body'lere test:true eklenir.
+  bool _isSandbox = false;
   String? _companyKey;
   String _baseUrl = _kDefaultBaseUrl;
+  /// ADIM 5: link domain soneki (configure ile override edilebilir; test/prod farkli
+  /// link domaini — backend LINK_DOMAIN_SUFFIX env'iyle esler). Varsayilan prod domaini.
+  String _linkDomainSuffix = _kLinkDomainSuffix;
   String? _userId;
   String? _clickId;
 
   /// Guards against concurrent flushes of the pending queue.
   Future<void>? _flushing;
+
+  /// In-memory guard so a double configure() in the same session does not read
+  /// the Install Referrer twice (the persisted flag guards across launches).
+  bool _referrerCheckedInSession = false;
+
+  /// Ayni guard'in iOS /match karsiligi.
+  bool _matchCheckedInSession = false;
+
+  /// SDK'nin kalici cihaz UUID'si (iOS /match device_id) — bir kez uretilir.
+  String? _deviceId;
 
   /// The current attribution click id, if any.
   String? get clickId => _clickId;
@@ -91,13 +124,22 @@ class AdSparkle {
     required String companyKey,
     String baseUrl = _kDefaultBaseUrl,
     bool debug = false,
+    AdSparkleEnvironment environment = AdSparkleEnvironment.production,
+    String linkDomainSuffix = _kLinkDomainSuffix,
   }) async {
     _debug = debug;
     _companyKey = companyKey;
     _baseUrl = baseUrl;
+    // ADIM 5: bas nokta + lowercase normalize (host karsilastirmasi lowercase host + `.suffix`).
+    final normSuffix = linkDomainSuffix.toLowerCase();
+    _linkDomainSuffix = normSuffix.startsWith('.') ? normSuffix : '.$normSuffix';
+    // ADIM 4: enum'u BOOL'a çöz (storage'a enum YAZMA — değeri değişirse eski
+    // storage kırılmasın). Dart named param → sıra sorunu yok, mevcut çağrılar korunur.
+    _isSandbox = environment == AdSparkleEnvironment.sandbox;
 
     await _storage.setCompanyKey(companyKey);
     await _storage.setBaseUrl(baseUrl);
+    await _storage.setIsSandbox(_isSandbox);
 
     // Restore previously persisted attribution state.
     _userId = await _storage.getUserId();
@@ -108,6 +150,54 @@ class AdSparkle {
     _log('configured (baseUrl=$baseUrl, userId=$_userId, clickId=$_clickId)');
 
     await _flushPending();
+
+    // Android deferred (install) attribution — Play Install Referrer.
+    // iOS'un aksine Play Store referrer'i kurulumda tasir; ILK configure()'da
+    // bir kez okunur ve click_id DETERMINISTIK kurtarilir. Non-blocking
+    // (iOS MatchClient / native Android / RN ile paritede): configure()'i
+    // geciktirmez — referrer cozulunce setClickId cagrilir. Zaten bir click_id
+    // varsa (deep-link) hic denenmez. Native taraf yoksa/degilse null.
+    if (_clickId == null &&
+        !_referrerCheckedInSession &&
+        !(await _storage.getReferrerChecked())) {
+      _referrerCheckedInSession = true; // oturum-ici cift-okuma korumasi
+      unawaited(InstallReferrer.readClickId().then((referrerClickId) async {
+        if (referrerClickId != null && _clickId == null) {
+          await setClickId(referrerClickId);
+        }
+        // Persist YALNIZCA okuma tamamlaninca — app okuma ortasinda oldurulurse
+        // bir sonraki acilista tekrar denenir (native Android SDK'dan saglam).
+        await _storage.setReferrerChecked(true);
+      }));
+    }
+
+    // iOS deferred (probabilistic) attribution — POST /api/tracking/match.
+    // Android'in aksine App Store referrer tasimaz; ILK configure()'da bir kez
+    // (matchChecked) cihaz sinyalleri + kalici device_id yollanip son 60dk iOS
+    // click'lerine eslestirilir. resolveMatch iOS-guard'li (Android/web → null).
+    // Non-blocking (referrer/RN ile paritede): click_id cozulunce setClickId →
+    // deferred kuyruk flush. device_id iOS guard'dan SONRA uretilir.
+    // ADIM 5: bekleyen register-click (Universal Link/App Links, deep-link
+    // deterministic) varsa /match'ten ONCE dene — deterministic olasilik-tabanliya
+    // oncelikli (iOS/RN SDK ile ayni davranis).
+    if (_clickId == null && (await _storage.getPendingRegisterClick()) != null) {
+      unawaited(_attemptRegisterClick());
+    } else if (_clickId == null &&
+        !_matchCheckedInSession &&
+        !(await _storage.getMatchChecked())) {
+      _matchCheckedInSession = true; // oturum-ici cift-cagri korumasi
+      unawaited(MatchClient.resolveMatch(
+        baseUrl: _baseUrl,
+        getDeviceId: _getOrCreateDeviceId,
+        test: _isSandbox,
+        log: _debug ? (m) => _log(m) : null,
+      ).then((matchedClickId) async {
+        if (matchedClickId != null && _clickId == null) {
+          await setClickId(matchedClickId); // chain'e ekler + deferred flush
+        }
+        await _storage.setMatchChecked(true);
+      }));
+    }
   }
 
   /// Sets and persists the current end-user identifier.
@@ -131,12 +221,58 @@ class AdSparkle {
   /// a `go_router` redirect). No-op if the URI carries no `click_id`.
   Future<void> handleDeepLink(Uri uri) async {
     final extracted = DeepLinkParser.extractClickId(uri);
-    if (extracted == null) {
+    if (extracted != null) {
+      await _persistClickId(extracted);
+      _log('handleDeepLink: click_id=$extracted');
+      return;
+    }
+    // ADIM 5 (E1): click_id yok VE URL bizim link domain'imizde → register-click
+    // (app YUKLU acildi, sunucuya ugramadi). Merchant deep-link'inde HAYIR.
+    if (!uri.host.toLowerCase().endsWith(_linkDomainSuffix)) {
       _log('handleDeepLink: no click_id in $uri');
       return;
     }
-    await _persistClickId(extracted);
-    _log('handleDeepLink: click_id=$extracted');
+    // E2: unique_key = path'in ILK segmenti; query_params ayri.
+    final uniqueKey = uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
+    if (uniqueKey.isEmpty) return;
+    if (_clickId != null) return; // zaten click_id var
+    await _storage.setPendingRegisterClick(<String, dynamic>{
+      'unique_key': uniqueKey,
+      'query_params': uri.queryParameters,
+    });
+    await _attemptRegisterClick();
+  }
+
+  /// Bekleyen register-click istegini dener (ADIM 5, E3). Basarida setClickId +
+  /// pending temizlenir; basarisizsa (ag yok / 4xx / 5xx) pending KALIR —
+  /// configure()/track()'te tekrar denenir. device_id = _getOrCreateDeviceId
+  /// (/match ile AYNI kalici UUID).
+  Future<void> _attemptRegisterClick() async {
+    if (_clickId != null) return;
+    final pending = await _storage.getPendingRegisterClick();
+    if (pending == null) return;
+    final uniqueKey = pending['unique_key'] as String?;
+    if (uniqueKey == null || uniqueKey.isEmpty) return;
+    final companyKey = _companyKey;
+    if (companyKey == null || companyKey.isEmpty) return;
+    final query = (pending['query_params'] as Map?)?.cast<String, String>() ??
+        <String, String>{};
+    final referrer = pending['referrer'] as String?;
+    final deviceId = await _getOrCreateDeviceId();
+    final clickId = await RegisterClient.resolve(
+      baseUrl: _baseUrl,
+      companyKey: companyKey,
+      uniqueKey: uniqueKey,
+      deviceId: deviceId,
+      queryParams: query,
+      referrer: referrer,
+      test: _isSandbox,
+      log: _debug ? (m) => _log(m) : null,
+    );
+    if (clickId != null && _clickId == null) {
+      await _storage.setPendingRegisterClick(null);
+      await setClickId(clickId); // → _persistClickId → _flushDeferred
+    }
   }
 
   /// Tracks an attribution event by its string [eventType].
@@ -293,18 +429,39 @@ class AdSparkle {
     String? currency,
     List<String>? productIds,
     Map<String, String>? customParams,
+    // Q2 (ADIM 6a): flush'ta deferred event'in ENQUEUE-ANI sandbox flag'i geçirilir →
+    // sandbox event, hangi env'de flush olursa olsun sandbox KALIR (dev/prod karışmaz).
+    // Normal track'te null → güncel [_isSandbox]. Bu param PRIVATE (_trackEvent); public
+    // API (trackInstall/trackPurchase...) değişmez.
+    bool? testOverride,
   }) async {
     if (!_configured) {
       _log('track: SDK not configured — call configure() first; skipping');
       return;
     }
 
+    final effectiveTest = testOverride ?? _isSandbox;
+
     // Re-read the chain so the 7-day sliding window is enforced at conversion
     // time (a chain that expired since configure() is treated as empty).
     final chain = await _loadChain();
     final clickId = chain.isNotEmpty ? chain.last : null;
     if (clickId == null || clickId.isEmpty) {
-      _log('track($eventType): no click_id — skipping');
+      // ADIM 5 (E3): bekleyen register-click varsa burada tekrar dene — basarida
+      // click_id gelir ve deferred kuyruk flush olur.
+      unawaited(_attemptRegisterClick());
+      // Eskiden drop; artik DEFER — click_id (deep-link / Install Referrer / iOS
+      // /match / register-click) gelince _flushDeferred bunlari gonderir
+      // (install-oncesi track'ler kaybolmaz).
+      await _enqueueDeferred(
+        eventType,
+        transactionId: transactionId,
+        amount: amount,
+        currency: currency,
+        productIds: productIds,
+        customParams: customParams,
+        sandbox: effectiveTest, // Q2: enqueue-anı flag'i event'e GÖM
+      );
       return;
     }
 
@@ -327,10 +484,16 @@ class AdSparkle {
     // Try to flush anything queued first so events are delivered in order.
     await _flushPending();
 
+    // ADIM 4: sandbox → şekil-doğrulama, ledger'a yazılmaz (HMAC bypass). Tek body
+    // hem send hem retry-enqueue'da kullanılır (kuyruktaki de test:true olur). Q2:
+    // effectiveTest (flush'ta stored flag, normal'de _isSandbox).
+    final body = event.toJson();
+    if (effectiveTest) body['test'] = true;
+
     final outcome = await _postback.send(
       baseUrl: _baseUrl,
       companyKey: _companyKey!,
-      body: event.toJson(),
+      body: body,
     );
 
     switch (outcome) {
@@ -339,7 +502,7 @@ class AdSparkle {
         break;
       case PostbackOutcome.retryable:
         _log('track($eventType): failed — queued for retry');
-        await _enqueue(event.toJson());
+        await _enqueue(body);
         break;
       case PostbackOutcome.permanent:
         _log('track($eventType): dropped (permanent failure)');
@@ -378,6 +541,64 @@ class AdSparkle {
     await _storage.setClickIds(chain);
     // Sliding window: reset the TTL on every new click id.
     await _storage.setClickIdsTs(DateTime.now().millisecondsSinceEpoch);
+
+    // click_id artik var → bekleyen (deferred) olaylari gonder.
+    await _flushDeferred();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Deferred events (click_id henuz yokken cagrilan track'ler)
+  // ---------------------------------------------------------------------------
+
+  Future<void> _enqueueDeferred(
+    String eventType, {
+    String? transactionId,
+    num? amount,
+    String? currency,
+    List<String>? productIds,
+    Map<String, String>? customParams,
+    bool sandbox = false,
+  }) async {
+    final queue = await _storage.getDeferredEvents();
+    queue.add(<String, dynamic>{
+      'event_type': eventType,
+      if (transactionId != null) 'transaction_id': transactionId,
+      if (amount != null) 'amount': amount,
+      if (currency != null) 'currency': currency,
+      if (productIds != null) 'product_ids': productIds,
+      if (customParams != null) 'custom_params': customParams,
+      // Q2: enqueue-anı sandbox flag'i event'le KALICI saklanır (JSON round-trip);
+      // flush'ta güncel state değil BU değer kullanılır → sandbox event sandbox kalır.
+      if (sandbox) 'test': true,
+    });
+    while (queue.length > _kMaxQueueSize) {
+      queue.removeAt(0); // FIFO cap
+    }
+    await _storage.setDeferredEvents(queue);
+    _log('event "$eventType" deferred (queue: ${queue.length})');
+  }
+
+  /// click_id set edildikten SONRA cagrilir. Kuyruk once temizlenir (yeniden
+  /// gonderim/yaris olmasin), sonra her biri _trackEvent ile gonderilir.
+  Future<void> _flushDeferred() async {
+    final queue = await _storage.getDeferredEvents();
+    if (queue.isEmpty) return;
+    await _storage.setDeferredEvents(<Map<String, dynamic>>[]);
+    _log('flushing ${queue.length} deferred event(s)');
+    for (final ev in queue) {
+      final eventType = ev['event_type'];
+      if (eventType is! String) continue;
+      await _trackEvent(
+        eventType,
+        transactionId: ev['transaction_id'] as String?,
+        amount: ev['amount'] as num?,
+        currency: ev['currency'] as String?,
+        productIds: (ev['product_ids'] as List?)?.cast<String>(),
+        customParams: (ev['custom_params'] as Map?)?.cast<String, String>(),
+        // Q2: enqueue-anında saklanan sandbox flag'i (güncel state DEĞİL) geçirilir.
+        testOverride: ev['test'] as bool?,
+      );
+    }
   }
 
   /// Loads the persisted click chain, enforcing the 7-day sliding window. If
@@ -425,6 +646,38 @@ class AdSparkle {
       buffer.write(chars[rand.nextInt(chars.length)]);
     }
     return buffer.toString();
+  }
+
+  /// SDK'nin KALICI cihaz UUID'sini dondurur (iOS /match device_id). Yoksa bir
+  /// kez uretir + saklar. Ayni cihaz her /match'te AYNI UUID → D2 tek-tuketim
+  /// idempotency'si tutarli. anon_ userId'den AYRIDIR (IDFV DEGIL — Dart erisemez).
+  Future<String> _getOrCreateDeviceId() async {
+    final existing = _deviceId ?? await _storage.getDeviceId();
+    if (existing != null && existing.isNotEmpty) {
+      _deviceId = existing;
+      return existing;
+    }
+    final id = _uuidv4();
+    _deviceId = id;
+    await _storage.setDeviceId(id);
+    _log('generated persistent deviceId $id');
+    return id;
+  }
+
+  /// RFC4122 v4 UUID (Random tabanli). Cihaz-id icin yeterli; backend `device_id`'yi
+  /// UUID-regex ile dogruladigi icin FORMAT gecerli olmali.
+  static String _uuidv4() {
+    final rand = Random();
+    String hex(int n) {
+      final b = StringBuffer();
+      for (var i = 0; i < n; i++) {
+        b.write(rand.nextInt(16).toRadixString(16));
+      }
+      return b.toString();
+    }
+
+    final variant = (8 + rand.nextInt(4)).toRadixString(16); // 8,9,a,b
+    return '${hex(8)}-${hex(4)}-4${hex(3)}-$variant${hex(3)}-${hex(12)}';
   }
 
   Future<void> _enqueue(Map<String, dynamic> body) async {
