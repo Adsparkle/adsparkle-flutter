@@ -18,7 +18,7 @@ Or add to your app's `pubspec.yaml` manually:
 
 ```yaml
 dependencies:
-  adsparkle_flutter: ^0.1.6
+  adsparkle_flutter: ^0.1.7
 ```
 
 Then:
@@ -200,3 +200,23 @@ signs requests — secret-based signing happens server-side only.
 ```dart
 final id = AdSparkle.instance.clickId; // String?
 ```
+
+## Attribution callback
+
+Register a callback to be notified the moment a `click_id` becomes active —
+no polling needed. It fires for every source (deep-link `?click_id`,
+register-click, Play Install Referrer, iOS `/match`):
+
+```dart
+AdSparkle.instance.onClickId = (String clickId) {
+  debugPrint('attributed: $clickId');
+};
+```
+
+- If a `click_id` is **already** available when you set the handler, it is
+  invoked immediately (once, asynchronously) with the current value — so a
+  late-registered handler never misses the attribution moment.
+- The same value never fires twice in a row; a **different** new `click_id`
+  fires again.
+- Set to `null` to remove the handler. The callback is optional — polling
+  `AdSparkle.instance.clickId` remains a valid alternative.

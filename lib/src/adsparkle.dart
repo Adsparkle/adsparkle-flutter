@@ -122,6 +122,62 @@ class AdSparkle {
   /// The current attribution click id, if any.
   String? get clickId => _clickId;
 
+  /// Attribution callback (S5: opsiyonel — set edilmemisse davranis birebir
+  /// eski davranistir). Bkz. [onClickId] setter.
+  void Function(String clickId)? _onClickId;
+
+  /// S3 dedup: handler'a en son teslim edilen deger. Ayni deger pes pese tekrar
+  /// tetiklemez; FARKLI yeni deger geldiginde tekrar cagrilir. Zincir TTL ile
+  /// temizlendiginde sifirlanir (ayni id yeniden aktif olursa yeni aktivasyondur).
+  String? _lastNotifiedClickId;
+
+  /// The registered attribution callback, if any.
+  void Function(String clickId)? get onClickId => _onClickId;
+
+  /// Registers an attribution callback that fires the moment a `click_id`
+  /// becomes active — no polling needed (Adjust attribution-callback parity).
+  /// It fires for every source: deep-link `?click_id`, register-click,
+  /// Install Referrer and iOS `/match`.
+  ///
+  /// S2: if a click_id is **already** available when the handler is set, the
+  /// handler is invoked immediately (once, asynchronously) with the current
+  /// value, so a late-registered handler never misses the attribution moment.
+  /// S3: the same value never fires twice in a row; a different new value
+  /// fires again. Set to `null` to remove the handler.
+  set onClickId(void Function(String clickId)? handler) {
+    _onClickId = handler;
+    final current = _clickId;
+    if (handler != null && current != null && current.isNotEmpty) {
+      // S2 hemen-cagri: mevcut deger ile bir kez (dedup kaydi da guncellenir
+      // ki ayni deger sonradan tekrar tetiklemesin — S3).
+      _lastNotifiedClickId = current;
+      _invokeClickIdHandler(handler, current);
+    }
+  }
+
+  /// S1: yeni bir click_id AKTIF oldugunda cagrilir ([_persistClickId]'nin
+  /// basarili her yolu + configure hydration). S3 dedup icerir.
+  void _notifyClickId(String clickId) {
+    final handler = _onClickId;
+    if (handler == null) return;
+    if (clickId == _lastNotifiedClickId) return;
+    _lastNotifiedClickId = clickId;
+    _invokeClickIdHandler(handler, clickId);
+  }
+
+  /// S4: handler'i asenkron (mikrotask) cagirir — kullanici kodu SDK state
+  /// guncellemelerinden SONRA calisir; handler'in throw'u SDK akisini kirmaz.
+  void _invokeClickIdHandler(
+      void Function(String clickId) handler, String clickId) {
+    scheduleMicrotask(() {
+      try {
+        handler(clickId);
+      } catch (e) {
+        _log('onClickId handler threw: $e');
+      }
+    });
+  }
+
   PostbackClient get _postback {
     return _clientOverride ??
         (_client ??= PostbackClient(
@@ -177,6 +233,12 @@ class AdSparkle {
 
     _configured = true;
     _log('configured (baseUrl=$baseUrl, userId=$_userId, clickId=$_clickId)');
+
+    // S1/S2 yaris kapatma: handler configure()'dan ONCE set edildiyse ve
+    // storage'dan bir click_id hydrate edildiyse, bu oturumda ilk kez AKTIF
+    // olan degeri bildir (S3 dedup ayni degeri iki kez teslim etmez).
+    final hydrated = _clickId;
+    if (hydrated != null && hydrated.isNotEmpty) _notifyClickId(hydrated);
 
     await _flushPending();
 
@@ -689,6 +751,10 @@ class AdSparkle {
     // Sliding window: reset the TTL on every new click id.
     await _storage.setClickIdsTs(DateTime.now().millisecondsSinceEpoch);
 
+    // S1: yeni click_id AKTIF — attribution callback'i tetikle (S3 dedup icinde;
+    // S4: handler mikrotask'ta, state + persist TAMAMLANDIKTAN sonra calisir).
+    _notifyClickId(clickId);
+
     // click_id artik var → bekleyen (deferred) olaylari gonder.
     await _flushDeferred();
   }
@@ -761,6 +827,9 @@ class AdSparkle {
       _log('click chain expired (ttl) — clearing');
       await _storage.clearClickIds();
       _clickId = null;
+      // S3 nuansi: zincir temizlendi — ayni click_id ileride YENIDEN aktif
+      // olursa bu yeni bir aktivasyondur, callback tekrar tetiklenmeli.
+      _lastNotifiedClickId = null;
       return <String>[];
     }
 

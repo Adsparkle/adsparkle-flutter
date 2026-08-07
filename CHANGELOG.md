@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.7
+
+- New attribution callback: `AdSparkle.instance.onClickId = (clickId) { ... }`
+  fires the moment a `click_id` becomes active, from any source (deep-link
+  `?click_id`, register-click, Play Install Referrer, iOS `/match`) — no
+  polling needed. If a click_id already exists when the handler is set, it is
+  invoked immediately (once, asynchronously) with the current value. The same
+  value never fires twice in a row; a different new value fires again.
+  Delivery is async (microtask) and never runs inside SDK state updates.
+  Optional and backwards compatible — reading `clickId` still works.
+
 ## 0.1.6
 
 - Deep-link `unique_key` is now the **last** non-empty path segment, matching
