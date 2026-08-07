@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
@@ -88,6 +89,20 @@ class AdSparkle {
   /// ADIM 5: link domain soneki (configure ile override edilebilir; test/prod farkli
   /// link domaini — backend LINK_DOMAIN_SUFFIX env'iyle esler). Varsayilan prod domaini.
   String _linkDomainSuffix = _kLinkDomainSuffix;
+
+  /// F2: configure edilen baseUrl'in lowercase host'u — link-host eslesmesinin
+  /// 2. kosulu (custom domain'de takip linki API host'undan servis edilir).
+  String? _baseUrlHost;
+
+  /// F2: ek link host'lari (trim+lowercase normalize) — custom takip
+  /// domain'leri icin (bkz. [_isLinkHost]).
+  List<String> _extraLinkHosts = const <String>[];
+
+  /// F4: register-click POST'u ucusta mi? handleDeepLink denemesi surerken
+  /// configure()/track() ayni pending icin IKINCI POST atmasin (cift ClickEvent
+  /// riski). Tum cikis yollarinda (finally) sifirlanir.
+  bool _registerClickInFlight = false;
+
   String? _userId;
   String? _clickId;
 
@@ -126,6 +141,10 @@ class AdSparkle {
     bool debug = false,
     AdSparkleEnvironment environment = AdSparkleEnvironment.production,
     String linkDomainSuffix = _kLinkDomainSuffix,
+    // F2: ek link host'lari — custom takip domain'leri (orn. "click.merchant.com").
+    // Host bir degere ESITSE ya da ".<deger>" ile bitiyorsa link-host sayilir
+    // (bkz. [_isLinkHost]). Named param → mevcut cagrilar GERIYE UYUMLU.
+    List<String> extraLinkHosts = const <String>[],
   }) async {
     _debug = debug;
     _companyKey = companyKey;
@@ -133,6 +152,16 @@ class AdSparkle {
     // ADIM 5: bas nokta + lowercase normalize (host karsilastirmasi lowercase host + `.suffix`).
     final normSuffix = linkDomainSuffix.toLowerCase();
     _linkDomainSuffix = normSuffix.startsWith('.') ? normSuffix : '.$normSuffix';
+    // F2: link-host eslesmesi icin baseUrl host'u (2. kosul) + ek host'lar
+    // (3. kosul), trim+lowercase normalize (native iOS/Android paritesi).
+    final parsedBaseHost = Uri.tryParse(baseUrl)?.host.toLowerCase();
+    _baseUrlHost = (parsedBaseHost == null || parsedBaseHost.isEmpty)
+        ? null
+        : parsedBaseHost;
+    _extraLinkHosts = extraLinkHosts
+        .map((h) => h.trim().toLowerCase())
+        .where((h) => h.isNotEmpty)
+        .toList(growable: false);
     // ADIM 4: enum'u BOOL'a çöz (storage'a enum YAZMA — değeri değişirse eski
     // storage kırılmasın). Dart named param → sıra sorunu yok, mevcut çağrılar korunur.
     _isSandbox = environment == AdSparkleEnvironment.sandbox;
@@ -151,52 +180,57 @@ class AdSparkle {
 
     await _flushPending();
 
-    // Android deferred (install) attribution — Play Install Referrer.
-    // iOS'un aksine Play Store referrer'i kurulumda tasir; ILK configure()'da
-    // bir kez okunur ve click_id DETERMINISTIK kurtarilir. Non-blocking
-    // (iOS MatchClient / native Android / RN ile paritede): configure()'i
-    // geciktirmez — referrer cozulunce setClickId cagrilir. Zaten bir click_id
-    // varsa (deep-link) hic denenmez. Native taraf yoksa/degilse null.
-    if (_clickId == null &&
-        !_referrerCheckedInSession &&
-        !(await _storage.getReferrerChecked())) {
-      _referrerCheckedInSession = true; // oturum-ici cift-okuma korumasi
-      unawaited(InstallReferrer.readClickId().then((referrerClickId) async {
-        if (referrerClickId != null && _clickId == null) {
-          await setClickId(referrerClickId);
-        }
-        // Persist YALNIZCA okuma tamamlaninca — app okuma ortasinda oldurulurse
-        // bir sonraki acilista tekrar denenir (native Android SDK'dan saglam).
-        await _storage.setReferrerChecked(true);
-      }));
-    }
-
-    // iOS deferred (probabilistic) attribution — POST /api/tracking/match.
-    // Android'in aksine App Store referrer tasimaz; ILK configure()'da bir kez
-    // (matchChecked) cihaz sinyalleri + kalici device_id yollanip son 60dk iOS
-    // click'lerine eslestirilir. resolveMatch iOS-guard'li (Android/web → null).
-    // Non-blocking (referrer/RN ile paritede): click_id cozulunce setClickId →
-    // deferred kuyruk flush. device_id iOS guard'dan SONRA uretilir.
-    // ADIM 5: bekleyen register-click (Universal Link/App Links, deep-link
-    // deterministic) varsa /match'ten ONCE dene — deterministic olasilik-tabanliya
-    // oncelikli (iOS/RN SDK ile ayni davranis).
-    if (_clickId == null && (await _storage.getPendingRegisterClick()) != null) {
+    // Deferred attribution onceligi (ADIM 5 + F3, native iOS/Android paritesi):
+    //   1. bekleyen register-click → Universal Link/App Links DETERMINISTIC
+    //      click; mevcut click_id olsa BILE denenir (sticky fix, E3 retry) —
+    //      pending yalnizca gercek bir tiklamadan dogar, zincir coklu click_id
+    //      destekler. Referrer/match'TEN ONCE (deterministic > probabilistic).
+    //   2. Android: Play Install Referrer → yalnizca click_id HALA yoksa BIR
+    //      KEZ oku (`referrer=click_id=<uuid>`).
+    //   3. iOS: /match → yalnizca click_id HALA yoksa BIR KEZ cihaz sinyalleri
+    //      + kalici device_id ile son 60dk iOS click'lerine eslestir.
+    // Hepsi non-blocking: configure()'i geciktirmez; cozulunce setClickId →
+    // zincir + deferred kuyruk flush.
+    if ((await _storage.getPendingRegisterClickRaw()) != null) {
       unawaited(_attemptRegisterClick());
-    } else if (_clickId == null &&
-        !_matchCheckedInSession &&
-        !(await _storage.getMatchChecked())) {
-      _matchCheckedInSession = true; // oturum-ici cift-cagri korumasi
-      unawaited(MatchClient.resolveMatch(
-        baseUrl: _baseUrl,
-        getDeviceId: _getOrCreateDeviceId,
-        test: _isSandbox,
-        log: _debug ? (m) => _log(m) : null,
-      ).then((matchedClickId) async {
-        if (matchedClickId != null && _clickId == null) {
-          await setClickId(matchedClickId); // chain'e ekler + deferred flush
-        }
-        await _storage.setMatchChecked(true);
-      }));
+    } else {
+      // Android deferred (install) attribution — Play Install Referrer.
+      // iOS'un aksine Play Store referrer'i kurulumda tasir. Zaten bir click_id
+      // varsa (deep-link) hic denenmez. Native taraf yoksa/degilse null.
+      if (_clickId == null &&
+          !_referrerCheckedInSession &&
+          !(await _storage.getReferrerChecked())) {
+        _referrerCheckedInSession = true; // oturum-ici cift-okuma korumasi
+        unawaited(InstallReferrer.readClickId().then((referrerClickId) async {
+          if (referrerClickId != null && _clickId == null) {
+            await setClickId(referrerClickId);
+          }
+          // Persist YALNIZCA okuma tamamlaninca — app okuma ortasinda oldurulurse
+          // bir sonraki acilista tekrar denenir (native Android SDK'dan saglam).
+          await _storage.setReferrerChecked(true);
+        }));
+      }
+
+      // iOS deferred (probabilistic) attribution — POST /api/tracking/match.
+      // Android'in aksine App Store referrer tasimaz; ILK configure()'da bir kez
+      // (matchChecked) denenir. resolveMatch iOS-guard'li (Android/web → null).
+      // device_id iOS guard'dan SONRA uretilir.
+      if (_clickId == null &&
+          !_matchCheckedInSession &&
+          !(await _storage.getMatchChecked())) {
+        _matchCheckedInSession = true; // oturum-ici cift-cagri korumasi
+        unawaited(MatchClient.resolveMatch(
+          baseUrl: _baseUrl,
+          getDeviceId: _getOrCreateDeviceId,
+          test: _isSandbox,
+          log: _debug ? (m) => _log(m) : null,
+        ).then((matchedClickId) async {
+          if (matchedClickId != null && _clickId == null) {
+            await setClickId(matchedClickId); // chain'e ekler + deferred flush
+          }
+          await _storage.setMatchChecked(true);
+        }));
+      }
     }
   }
 
@@ -218,7 +252,12 @@ class AdSparkle {
   /// Extracts a `click_id` from [uri]'s query parameters and persists it.
   ///
   /// Wire this up to your deep link handler (e.g. `uni_links`, `app_links`, or
-  /// a `go_router` redirect). No-op if the URI carries no `click_id`.
+  /// a `go_router` redirect). No-op if the URI carries no `click_id` and is not
+  /// on a recognised link domain (see [_isLinkHost]).
+  ///
+  /// NOT (F3): mevcut bir click_id, YENI bir link tiklamasinin register-click'ini
+  /// BLOKE ETMEZ — her gercek tiklama yeni bir click'tir; yeni click_id aktif
+  /// olur ve zincire eklenir (sticky click_id fix).
   Future<void> handleDeepLink(Uri uri) async {
     final extracted = DeepLinkParser.extractClickId(uri);
     if (extracted != null) {
@@ -228,14 +267,39 @@ class AdSparkle {
     }
     // ADIM 5 (E1): click_id yok VE URL bizim link domain'imizde → register-click
     // (app YUKLU acildi, sunucuya ugramadi). Merchant deep-link'inde HAYIR.
-    if (!uri.host.toLowerCase().endsWith(_linkDomainSuffix)) {
-      _log('handleDeepLink: no click_id in $uri');
+    // Host uc kosuldan biriyle eslesir (F2, bkz. [_isLinkHost]).
+    final host = uri.host.toLowerCase();
+    if (host.isEmpty || !_isLinkHost(host)) {
+      // Sessiz dusme yerine bilgilendirici log: custom domain kullanan merchant
+      // configure(linkDomainSuffix/extraLinkHosts) eksikligini burada gorur.
+      if (uri.pathSegments.any((s) => s.isNotEmpty)) {
+        final baseHostPart =
+            _baseUrlHost == null ? '' : ' or baseUrl host "$_baseUrlHost"';
+        final extrasPart = _extraLinkHosts.isEmpty
+            ? ''
+            : ', extraLinkHosts=$_extraLinkHosts';
+        _log('handleDeepLink: host "$host" is not a link domain (expected '
+            'suffix "$_linkDomainSuffix"$baseHostPart$extrasPart) — '
+            'register-click skipped: $uri');
+      } else {
+        _log('handleDeepLink: no click_id in $uri');
+      }
       return;
     }
-    // E2: unique_key = path'in ILK segmenti; query_params ayri.
-    final uniqueKey = uri.pathSegments.isNotEmpty ? uri.pathSegments.first : '';
-    if (uniqueKey.isEmpty) return;
-    if (_clickId != null) return; // zaten click_id var
+    // E2 (F1): unique_key = path'in SON bos-olmayan segmenti — backend rotasi
+    // `/:appSlug?/:uniqueKey` ile ayni (cok-app linki `/<appSlug>/<uniqueKey>`;
+    // tek segmentli linkte ilk == son → geriye uyumlu). query_params ayri.
+    var uniqueKey = '';
+    for (final segment in uri.pathSegments) {
+      if (segment.isNotEmpty) uniqueKey = segment;
+    }
+    if (uniqueKey.isEmpty) {
+      _log('handleDeepLink: link domain URL had no unique_key: $uri');
+      return;
+    }
+    // F3 (sticky fix): yeni bir link-domain tiklamasi = YENI click — mevcut
+    // click_id olsa bile HER ZAMAN pending yazilir ve denenir (zincir coklu
+    // click_id destekler; ayni id gelirse setClickId dedup'u tekrari engeller).
     await _storage.setPendingRegisterClick(<String, dynamic>{
       'unique_key': uniqueKey,
       'query_params': uri.queryParameters,
@@ -243,36 +307,116 @@ class AdSparkle {
     await _attemptRegisterClick();
   }
 
-  /// Bekleyen register-click istegini dener (ADIM 5, E3). Basarida setClickId +
-  /// pending temizlenir; basarisizsa (ag yok / 4xx / 5xx) pending KALIR —
-  /// configure()/track()'te tekrar denenir. device_id = _getOrCreateDeviceId
+  /// F2: [host] (lowercase) bir takip-link host'u mu?
+  ///  1. [_linkDomainSuffix] ile bitiyorsa (`<slug>.go.adsparkle.co`),
+  ///  2. VEYA configure edilen baseUrl'in host'una ESITSE (custom domain'de
+  ///     takip linki API host'undan servis edilir),
+  ///  3. VEYA [_extraLinkHosts]'taki bir degere esitse / ".<deger>" ile
+  ///     bitiyorsa (deger "." ile basliyorsa duz sonek eslesmesi).
+  bool _isLinkHost(String host) {
+    if (host.endsWith(_linkDomainSuffix)) return true;
+    final apiHost = _baseUrlHost;
+    if (apiHost != null && host == apiHost) return true;
+    for (final extra in _extraLinkHosts) {
+      final match = extra.startsWith('.')
+          ? host.endsWith(extra)
+          : (host == extra || host.endsWith('.$extra'));
+      if (match) return true;
+    }
+    return false;
+  }
+
+  /// Bekleyen register-click istegini dener (ADIM 5, E3).
+  ///
+  /// - Basari → pending compare-and-clear ile temizlenir ve yeni click_id
+  ///   KOSULSUZ aktif olur (F3 sticky fix; zincire eklenir).
+  /// - KALICI hata (4xx — 408/429 haric — veya 2xx-click_id'siz) → pending
+  ///   TEMIZLENIR (ayni yanlis key sonsuza dek denenmez) ve Android'de Install
+  ///   Referrer fallback'inin onu acilir (F4).
+  /// - GECICI hata (ag / 5xx / 408 / 429) → pending KALIR; sonraki
+  ///   configure()/track()'te tekrar denenir.
+  ///
+  /// Mevcut _clickId'ye BAKMAZ: pending = kaydedilmemis yeni tiklama, her zaman
+  /// denenir (zincir coklu click_id destekler). device_id = _getOrCreateDeviceId
   /// (/match ile AYNI kalici UUID).
   Future<void> _attemptRegisterClick() async {
-    if (_clickId != null) return;
-    final pending = await _storage.getPendingRegisterClick();
-    if (pending == null) return;
-    final uniqueKey = pending['unique_key'] as String?;
-    if (uniqueKey == null || uniqueKey.isEmpty) return;
+    // In-flight guard: POST ucustayken (handleDeepLink baslatti) configure()/
+    // track() ayni pending icin IKINCI POST atmasin — cift ClickEvent riski.
+    if (_registerClickInFlight) return;
+    final raw = await _storage.getPendingRegisterClickRaw();
+    if (raw == null) return;
+    Map<String, dynamic>? pending;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map<String, dynamic>) pending = decoded;
+    } catch (_) {/* bozuk kayit */}
+    final uniqueKey = pending?['unique_key'] as String?;
+    if (pending == null || uniqueKey == null || uniqueKey.isEmpty) {
+      await _storage.clearPendingRegisterClickIf(raw); // bozuk kayit → temizle
+      return;
+    }
     final companyKey = _companyKey;
     if (companyKey == null || companyKey.isEmpty) return;
     final query = (pending['query_params'] as Map?)?.cast<String, String>() ??
         <String, String>{};
     final referrer = pending['referrer'] as String?;
     final deviceId = await _getOrCreateDeviceId();
-    final clickId = await RegisterClient.resolve(
-      baseUrl: _baseUrl,
-      companyKey: companyKey,
-      uniqueKey: uniqueKey,
-      deviceId: deviceId,
-      queryParams: query,
-      referrer: referrer,
-      test: _isSandbox,
-      log: _debug ? (m) => _log(m) : null,
-    );
-    if (clickId != null && _clickId == null) {
-      await _storage.setPendingRegisterClick(null);
-      await setClickId(clickId); // → _persistClickId → _flushDeferred
+    _registerClickInFlight = true;
+    try {
+      final result = await RegisterClient.resolve(
+        baseUrl: _baseUrl,
+        companyKey: companyKey,
+        uniqueKey: uniqueKey,
+        deviceId: deviceId,
+        queryParams: query,
+        referrer: referrer,
+        test: _isSandbox,
+        log: _debug ? (m) => _log(m) : null,
+      );
+      switch (result.outcome) {
+        case RegisterOutcome.success:
+          // F4: compare-and-clear — POST ucustayken YENI bir tap pending'i
+          // degistirdiyse o kayit korunur (sonraki tetikte gonderilir).
+          await _storage.clearPendingRegisterClickIf(raw);
+          // F3: yeni tiklama KOSULSUZ aktif click olur (sticky fix); zincir
+          // dedup'i tekrarlari zaten engeller.
+          await setClickId(result.clickId!); // → _persistClickId → _flushDeferred
+          break;
+        case RegisterOutcome.permanent:
+          // Kalici hata (yanlis/eskimis unique_key vb.) → pending'i birakmakta
+          // fayda yok; temizle ki sonsuz yanlis-key dongusu bitsin ve platform
+          // fallback'inin (Android Install Referrer) onu acilsin.
+          await _storage.clearPendingRegisterClickIf(raw);
+          _log('register-click permanently failed for unique_key "$uniqueKey" '
+              '— pending cleared');
+          await _fallbackToInstallReferrer();
+          break;
+        case RegisterOutcome.transient:
+          break; // pending kalir → sonraki configure()/track()'te tekrar denenir
+      }
+    } finally {
+      _registerClickInFlight = false;
     }
+  }
+
+  /// F4: kalici register-click hatasindan sonra Play Install Referrer
+  /// fallback'i (yalnizca Android): pending artik yolu kapatmadigina gore,
+  /// referrer HALA okunmadiysa ve click_id hala yoksa BIR KEZ dene
+  /// (configure'daki oncelik akisiyla ayni; native Android paritesi). iOS'ta
+  /// karsiligi /match'tir ve pending temizlendigi icin bir sonraki
+  /// configure()'da kendiliginden denenir (native iOS ile ayni).
+  Future<void> _fallbackToInstallReferrer() async {
+    if (kIsWeb || defaultTargetPlatform != TargetPlatform.android) return;
+    if (_clickId != null) return;
+    if (_referrerCheckedInSession || await _storage.getReferrerChecked()) {
+      return;
+    }
+    _referrerCheckedInSession = true;
+    final referrerClickId = await InstallReferrer.readClickId();
+    if (referrerClickId != null && _clickId == null) {
+      await setClickId(referrerClickId);
+    }
+    await _storage.setReferrerChecked(true);
   }
 
   /// Tracks an attribution event by its string [eventType].
@@ -445,11 +589,14 @@ class AdSparkle {
     // Re-read the chain so the 7-day sliding window is enforced at conversion
     // time (a chain that expired since configure() is treated as empty).
     final chain = await _loadChain();
+    // F5 (E3 + sticky fix): bekleyen register-click varsa click_id DOLU olsa
+    // bile tekrar dene — gecici hatada kalmis YENI bir tiklamanin click'i
+    // kaybolmasin (basarida setClickId zinciri gunceller).
+    if ((await _storage.getPendingRegisterClickRaw()) != null) {
+      unawaited(_attemptRegisterClick());
+    }
     final clickId = chain.isNotEmpty ? chain.last : null;
     if (clickId == null || clickId.isEmpty) {
-      // ADIM 5 (E3): bekleyen register-click varsa burada tekrar dene — basarida
-      // click_id gelir ve deferred kuyruk flush olur.
-      unawaited(_attemptRegisterClick());
       // Eskiden drop; artik DEFER — click_id (deep-link / Install Referrer / iOS
       // /match / register-click) gelince _flushDeferred bunlari gonderir
       // (install-oncesi track'ler kaybolmaz).

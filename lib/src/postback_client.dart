@@ -9,10 +9,11 @@ enum PostbackOutcome {
   /// The server acknowledged the event (2xx).
   success,
 
-  /// A transient failure (5xx or a network error). Safe to retry / queue.
+  /// A transient failure (5xx, 408, 429, or a network error). Safe to
+  /// retry / queue — the event is not lost.
   retryable,
 
-  /// A permanent failure (4xx). The event should be dropped, not queued.
+  /// A permanent failure (other 4xx). The event should be dropped, not queued.
   permanent,
 }
 
@@ -37,7 +38,8 @@ class PostbackClient {
   /// publishable [companyKey].
   ///
   /// Retries up to [maxAttempts] times with exponential backoff on retryable
-  /// failures (5xx / network errors). Returns the final [PostbackOutcome].
+  /// failures (5xx / 408 / 429 / network errors). Returns the final
+  /// [PostbackOutcome].
   Future<PostbackOutcome> send({
     required String baseUrl,
     required String companyKey,
@@ -59,7 +61,10 @@ class PostbackClient {
         if (status >= 200 && status < 300) {
           return PostbackOutcome.success;
         }
-        if (status >= 500) {
+        // F6: 408 (request timeout) ve 429 (rate limit) dogasi geregi
+        // tekrarlanabilir → GECICI (native iOS/Android siniflandirmasiyla ayni).
+        // Diger 4xx → KALICI (retry sonucu degistirmez), event dusurulur.
+        if (status >= 500 || status == 408 || status == 429) {
           outcome = PostbackOutcome.retryable;
           _log?.call('postback $status (attempt $attempt/$maxAttempts), retrying');
         } else {

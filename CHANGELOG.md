@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.1.6
+
+- Deep-link `unique_key` is now the **last** non-empty path segment, matching
+  the backend `/:appSlug?/:uniqueKey` route (multi-app `/slug/key` links;
+  single-segment links are unchanged).
+- Link-host acceptance now also matches the configured `baseUrl` host, plus an
+  optional `configure(extraLinkHosts: [...])` list (equal or `.suffix` match,
+  trimmed and lowercased). Existing `configure` calls are unchanged.
+- Sticky click_id fix: an existing click_id no longer blocks register-click for
+  a new link tap — the new id unconditionally becomes active and joins the
+  chain. An expired (7-day TTL) chain now also clears the persisted scalar
+  `click_id`.
+- register-click failures are classified: 4xx (except 408/429) is permanent —
+  the pending request is cleared (unblocking the Android Install Referrer
+  fallback); 5xx/408/429/network errors keep it for retry. Pending is cleared
+  with compare-and-clear so an in-flight response never wipes a newer tap, and
+  an in-flight guard prevents duplicate register-click POSTs.
+- `track()` retries a pending register-click even when a click_id already
+  exists.
+- Postbacks now treat HTTP 408/429 as retryable (queued) instead of permanent.
+
 ## 0.1.5
 
 - `configure()` now accepts an optional `linkDomainSuffix` (default

@@ -62,12 +62,15 @@ class AdSparkleStorage {
   Future<void> setClickIdsTs(int value) async =>
       (await _instance).setInt(_keyClickIdsTs, value);
 
-  /// Clears the persisted click chain and its timestamp (e.g. after the
-  /// attribution window has elapsed).
+  /// Clears the persisted click chain, its timestamp AND the scalar click id
+  /// (e.g. after the attribution window has elapsed). F3: skalar `click_id` da
+  /// silinir — aksi halde suresi dolmus click bir sonraki configure()'da restore
+  /// edilip sonsuza dek yasar (native iOS/Android paritesi).
   Future<void> clearClickIds() async {
     final prefs = await _instance;
     await prefs.remove(_keyClickIds);
     await prefs.remove(_keyClickIdsTs);
+    await prefs.remove(_keyClickId);
   }
 
   /// Whether the Android Play Install Referrer has already been queried once.
@@ -141,6 +144,23 @@ class AdSparkleStorage {
       await prefs.remove(_keyPendingRegisterClick);
     } else {
       await prefs.setString(_keyPendingRegisterClick, jsonEncode(value));
+    }
+  }
+
+  /// Bekleyen register-click kaydinin HAM JSON string'i (compare-and-clear
+  /// icin). `null` ise bekleyen istek yok.
+  Future<String?> getPendingRegisterClickRaw() async =>
+      (await _instance).getString(_keyPendingRegisterClick);
+
+  /// F4: pending kaydi YALNIZCA hala [expectedRaw]'a esitse siler
+  /// (compare-and-clear). A tap'inin POST'u ucustayken B tap'i pending'i
+  /// degistirdiyse A'nin completion'i B'nin kaydini SILMEZ; yeni pending bir
+  /// sonraki tetikte gonderilir (native Android clearPendingRegisterClickIf
+  /// paritesi).
+  Future<void> clearPendingRegisterClickIf(String expectedRaw) async {
+    final prefs = await _instance;
+    if (prefs.getString(_keyPendingRegisterClick) == expectedRaw) {
+      await prefs.remove(_keyPendingRegisterClick);
     }
   }
 

@@ -1,7 +1,8 @@
 # adsparkle_flutter
 
 Flutter client SDK for the **AdSparkle** affiliate attribution tracking
-platform. Pure Dart — **no platform channels**.
+platform. Deterministic Android install attribution via the Play Install
+Referrer; pure Dart on every other platform.
 
 Mobile apps use this SDK to capture an attribution `click_id` from a deep link
 and send affiliate attribution events (install, sign up, purchase, …) to the
@@ -17,7 +18,7 @@ Or add to your app's `pubspec.yaml` manually:
 
 ```yaml
 dependencies:
-  adsparkle_flutter: ^0.1.4
+  adsparkle_flutter: ^0.1.6
 ```
 
 Then:
@@ -38,11 +39,21 @@ Future<void> main() async {
     companyKey: 'co_xxxxxxxxxxxxxxxx', // publishable key (see note below)
     baseUrl: 'https://api.adsparkle.co', // optional, this is the default
     debug: true,                       // verbose logs in debug builds
+    // Optional — only needed when your tracking links use a custom domain:
+    // linkDomainSuffix: '.go.adsparkle.co', // default
+    // extraLinkHosts: ['click.merchant.com'],
   );
 
   runApp(const MyApp());
 }
 ```
+
+A universal-link / App Links URL is recognised as a tracking link when its host
+ends with `linkDomainSuffix`, equals the `baseUrl` host, or equals / is a
+subdomain of an entry in `extraLinkHosts`. For such links opened while the app
+is already installed, the SDK registers the click with the backend using the
+**last** non-empty path segment as the link key (works for both `/<key>` and
+multi-app `/<appSlug>/<key>` links).
 
 ## Identifying the user
 
@@ -62,7 +73,7 @@ https://app.example.com/open?click_id=2f1c9b7e-...
 ```
 
 Pass any incoming `Uri` to `handleDeepLink`; the SDK extracts, persists, and
-chains the `click_id` (most-recent-last, de-duplicated, capped at 10).
+chains the `click_id` (most-recent-last, de-duplicated, capped at 50).
 
 ### With `uni_links` / `app_links`
 
@@ -136,8 +147,10 @@ await AdSparkle.instance.track(
 );
 ```
 
-If there is no `click_id` or no `user_id` available, `track` quietly skips the
-event (a debug log is emitted when `debug: true`) — it never throws.
+If there is no `click_id` yet, the event is saved to a persisted deferred queue
+and sent automatically once a `click_id` arrives (deep link, Install Referrer,
+`/match`, or register-click). If no `user_id` was set, a persistent anonymous
+identifier is generated. `track` never throws.
 
 ## Event types
 
@@ -170,11 +183,11 @@ already supported by `track` (and the typed helpers) for every event type.
 ## Reliability
 
 - Postbacks go to `POST {baseUrl}/api/tracking/postback`.
-- On `5xx` responses or network errors the SDK retries up to **3 times** with
-  exponential backoff.
+- On `5xx`/`408`/`429` responses or network errors the SDK retries up to
+  **3 times** with exponential backoff.
 - If all attempts fail, the event is saved to a **persisted pending queue**
   (`shared_preferences`) and re-sent on the next `track()` / `configure()`.
-- `4xx` responses are treated as permanent and the event is dropped.
+- Other `4xx` responses are treated as permanent and the event is dropped.
 
 ## Security note — the company key is *publishable*
 

@@ -1,6 +1,6 @@
 name: adsparkle_flutter
 description: Flutter client SDK for the AdSparkle affiliate attribution tracking platform. Deterministic Android install attribution via the Play Install Referrer; pure Dart on every other platform.
-version: 0.1.5
+version: 0.1.6
 repository: https://github.com/Adsparkle/adsparkle-flutter
 
 environment:
